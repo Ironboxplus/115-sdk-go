@@ -69,7 +69,7 @@ type OfflineTaskListResp struct {
 type OfflineTask struct {
 	InfoHash     string `json:"info_hash"`      // 任务 sha1
 	AddTime      int64  `json:"add_time"`       // 添加时间戳
-	PercentDone  int    `json:"percentDone"`    // 下载进度
+	PercentDone  float64 `json:"percentDone"`  // 下载进度
 	Size         int64  `json:"size"`           // 总大小（字节）
 	Name         string `json:"name"`           // 任务名
 	LastUpdate   int64  `json:"last_update"`    // 最后更新时间戳
