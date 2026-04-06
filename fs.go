@@ -330,6 +330,26 @@ func (c *Client) DelFile(ctx context.Context, req *DelFileReq) ([]string, error)
 	return resp, err
 }
 
+// FlexString can unmarshal both JSON string and number into a string.
+type FlexString string
+
+func (f *FlexString) UnmarshalJSON(data []byte) error {
+	if len(data) > 0 && data[0] == '"' {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		*f = FlexString(s)
+		return nil
+	}
+	var n json.Number
+	if err := json.Unmarshal(data, &n); err != nil {
+		return err
+	}
+	*f = FlexString(n.String())
+	return nil
+}
+
 type RbListResp_FileInfo struct {
 	ID         string `json:"id"`
 	FileName   string `json:"file_name"`
@@ -338,7 +358,7 @@ type RbListResp_FileInfo struct {
 	Dtime      string `json:"dtime"`
 	ThumbURL   string `json:"thumb_url"`
 	Status     string `json:"status"`
-	CID        string `json:"cid"`
+	CID        FlexString `json:"cid"`
 	ParentName string `json:"parent_name"`
 	PickCode   string `json:"pick_code"`
 	IsV        int    `json:"isv"`
