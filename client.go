@@ -3,6 +3,7 @@ package sdk
 import (
 	"context"
 	"net/http"
+	"sync"
 
 	"resty.dev/v3"
 )
@@ -13,6 +14,7 @@ type Client struct {
 	accessToken    string
 	refreshToken   string
 	onRefreshToken func(string, string)
+	refreshMu      sync.Mutex
 }
 
 func New(opts ...Option) *Client {
