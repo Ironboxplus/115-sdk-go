@@ -36,9 +36,12 @@ func (c *Client) passportRequest(ctx context.Context, url, method string, respDa
 
 func (c *Client) authRequest(ctx context.Context, url, method string, respData any, extractData, retry bool, opts ...RestyOption) (*resty.Response, error) {
 	var resp Resp[json.RawMessage]
+	c.refreshMu.Lock()
+	usedToken := c.accessToken
+	c.refreshMu.Unlock()
 	response, err := c.Request(ctx, url, method, append(opts, ReqWithResp(&resp), func(request *resty.Request) {
-		if c.accessToken != "" {
-			request.SetAuthToken(c.accessToken)
+		if usedToken != "" {
+			request.SetAuthToken(usedToken)
 		}
 	})...)
 	// fmt.Printf("%s->%s\n resp: %s\n", method, url, response.String())
@@ -47,9 +50,15 @@ func (c *Client) authRequest(ctx context.Context, url, method string, respData a
 	}
 	if !resp.State {
 		if !retry && (resp.Code == 99 || Is401Started(resp.Code)) {
-			_, err := c.RefreshToken(ctx)
-			if err != nil {
-				return response, err
+			c.refreshMu.Lock()
+			if c.accessToken != usedToken {
+				c.refreshMu.Unlock()
+			} else {
+				_, err := c.RefreshToken(ctx)
+				c.refreshMu.Unlock()
+				if err != nil {
+					return response, err
+				}
 			}
 			return c.authRequest(ctx, url, method, respData, extractData, true, opts...)
 		}
