@@ -1,12 +1,18 @@
 package sdk
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 
 	"resty.dev/v3"
 )
+
+func isEmptyData(data json.RawMessage) bool {
+	d := bytes.TrimSpace(data)
+	return len(d) == 0 || bytes.Equal(d, []byte("null"))
+}
 
 func (c *Client) Request(ctx context.Context, url string, method string, opts ...RestyOption) (*resty.Response, error) {
 	req := c.NewRequest(ctx)
@@ -66,12 +72,21 @@ func (c *Client) authRequest(ctx context.Context, url, method string, respData a
 	}
 	if respData != nil {
 		if extractData {
+			if isEmptyData(resp.Data) {
+				return response, ErrDataEmpty
+			}
 			err = json.Unmarshal(resp.Data, respData)
+			if err != nil {
+				if bytes.Equal(bytes.TrimSpace(resp.Data), []byte("[]")) {
+					return response, ErrDataEmpty
+				}
+				return response, err
+			}
 		} else {
 			err = json.Unmarshal(response.Bytes(), respData)
-		}
-		if err != nil {
-			return response, err
+			if err != nil {
+				return response, err
+			}
 		}
 	}
 	return response, nil

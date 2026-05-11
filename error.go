@@ -1,6 +1,11 @@
 package sdk
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+var ErrDataEmpty = errors.New("api returned empty data")
 
 type Error struct {
 	Code    int64  `json:"code"`
