@@ -7,6 +7,8 @@ import (
 
 var ErrObjectNotFound = errors.New("object not found")
 
+var ErrDataEmpty = errors.New("api returned empty data")
+
 type Error struct {
 	Code    int64  `json:"code"`
 	Message string `json:"message"`

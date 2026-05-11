@@ -3,6 +3,7 @@ package sdk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -112,6 +113,102 @@ func TestConcurrentAuthRequestRefreshesOnlyOnce(t *testing.T) {
 		if err != nil {
 			t.Errorf("goroutine %d failed: %v", i, err)
 		}
+	}
+}
+
+func TestAuthRequestReturnsErrDataEmptyForEmptyArray(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 115 API returns empty array when path does not exist
+		writeJSON(w, map[string]any{
+			"state": true,
+			"code":  0,
+			"data":  []any{},
+		})
+	}))
+	defer server.Close()
+
+	target, _ := url.Parse(server.URL)
+	client := New(WithAccessToken("valid-token"))
+	client.SetHttpClient(&http.Client{
+		Transport: &rewriteTransport{target: target, base: http.DefaultTransport},
+	})
+
+	type FolderInfo struct {
+		FileID   string `json:"file_id"`
+		FileName string `json:"file_name"`
+	}
+	var resp FolderInfo
+	_, err := client.AuthRequest(ctx(t), server.URL+"/open/folder/info", http.MethodGet, &resp)
+
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, ErrDataEmpty) {
+		t.Fatalf("expected ErrDataEmpty, got: %v", err)
+	}
+}
+
+func TestAuthRequestReturnsErrDataEmptyForNull(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{
+			"state": true,
+			"code":  0,
+			"data":  nil,
+		})
+	}))
+	defer server.Close()
+
+	target, _ := url.Parse(server.URL)
+	client := New(WithAccessToken("valid-token"))
+	client.SetHttpClient(&http.Client{
+		Transport: &rewriteTransport{target: target, base: http.DefaultTransport},
+	})
+
+	type FolderInfo struct {
+		FileID string `json:"file_id"`
+	}
+	var resp FolderInfo
+	_, err := client.AuthRequest(ctx(t), server.URL+"/open/folder/info", http.MethodGet, &resp)
+
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, ErrDataEmpty) {
+		t.Fatalf("expected ErrDataEmpty, got: %v", err)
+	}
+}
+
+func TestAuthRequestSucceedsForValidObject(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{
+			"state": true,
+			"code":  0,
+			"data": map[string]any{
+				"file_id":   "12345",
+				"file_name": "test_folder",
+			},
+		})
+	}))
+	defer server.Close()
+
+	target, _ := url.Parse(server.URL)
+	client := New(WithAccessToken("valid-token"))
+	client.SetHttpClient(&http.Client{
+		Transport: &rewriteTransport{target: target, base: http.DefaultTransport},
+	})
+
+	type FolderInfo struct {
+		FileID   string `json:"file_id"`
+		FileName string `json:"file_name"`
+	}
+	var resp FolderInfo
+	_, err := client.AuthRequest(ctx(t), server.URL+"/open/folder/info", http.MethodGet, &resp)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.FileID != "12345" || resp.FileName != "test_folder" {
+		t.Fatalf("unexpected resp: %+v", resp)
 	}
 }
 
