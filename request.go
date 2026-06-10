@@ -5,9 +5,30 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"resty.dev/v3"
 )
+
+// refreshTimeout bounds a token refresh once it starts. The refresh must not
+// inherit the caller's cancellation: 115 rotates the refresh_token server-side
+// on every refresh call, so a request canceled mid-flight (e.g. a video player
+// seeking) consumes the one-time token while the response carrying its
+// replacement is lost — permanently bricking authentication.
+const refreshTimeout = 30 * time.Second
+
+// shouldRefreshToken reports whether an API error code indicates a stale
+// access_token that a refresh could fix. Refresh-endpoint errors are excluded:
+//   - 40140117 (refresh frequently): rate-limited, the access_token is not the
+//     problem and another refresh only feeds the limiter;
+//   - 40140120 (refresh token error): the refresh_token itself is dead, only
+//     re-authorization can recover.
+func shouldRefreshToken(code int64) bool {
+	if code == CodeRefreshFrequently || code == CodeRefreshTokenError {
+		return false
+	}
+	return code == 99 || Is401Started(code)
+}
 
 func isEmptyData(data json.RawMessage) bool {
 	d := bytes.TrimSpace(data)
@@ -55,12 +76,17 @@ func (c *Client) authRequest(ctx context.Context, url, method string, respData a
 		return nil, err
 	}
 	if !resp.State {
-		if !retry && (resp.Code == 99 || Is401Started(resp.Code)) {
+		if !retry && shouldRefreshToken(resp.Code) {
 			c.refreshMu.Lock()
 			if c.accessToken != usedToken {
 				c.refreshMu.Unlock()
 			} else {
-				_, err := c.RefreshToken(ctx)
+				// Detach from the caller's context: once a refresh request is
+				// sent, it must run to completion or the rotated refresh_token
+				// is lost (see refreshTimeout).
+				refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshTimeout)
+				_, err := c.RefreshToken(refreshCtx)
+				cancel()
 				c.refreshMu.Unlock()
 				if err != nil {
 					return response, err

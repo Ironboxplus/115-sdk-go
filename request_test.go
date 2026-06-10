@@ -216,3 +216,127 @@ func ctx(t *testing.T) context.Context {
 	t.Helper()
 	return context.Background()
 }
+
+// A refresh must complete even if the API request that triggered it is
+// canceled mid-refresh (e.g. a video player aborting a seek). Otherwise the
+// one-time refresh_token is consumed server-side while its replacement is
+// lost in the aborted response.
+func TestRefreshSurvivesCallerCancellation(t *testing.T) {
+	var refreshCount atomic.Int32
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open/refreshToken":
+			refreshCount.Add(1)
+			close(refreshStarted)
+			<-releaseRefresh // hold the refresh in flight while caller cancels
+			writeJSON(w, map[string]any{
+				"state": 1,
+				"code":  0,
+				"data": map[string]any{
+					"access_token":  "fresh-token",
+					"refresh_token": "fresh-rt",
+					"expires_in":    7200,
+				},
+			})
+		case "/open/ufile/files":
+			if r.Header.Get("Authorization") == "Bearer fresh-token" {
+				writeJSON(w, map[string]any{"state": true, "data": []any{}, "count": 0})
+				return
+			}
+			writeJSON(w, map[string]any{
+				"state":   false,
+				"code":    40100000,
+				"message": "token expired",
+			})
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	target, _ := url.Parse(server.URL)
+	var savedAccess, savedRefresh string
+	client := New(
+		WithAccessToken("expired-token"),
+		WithRefreshToken("old-rt"),
+		WithOnRefreshToken(func(at, rt string) { savedAccess, savedRefresh = at, rt }),
+	)
+	client.SetHttpClient(&http.Client{
+		Transport: &rewriteTransport{target: target, base: http.DefaultTransport},
+	})
+
+	callerCtx, cancelCaller := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.AuthRequest(callerCtx, ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
+		done <- err
+	}()
+
+	<-refreshStarted // refresh request is now in flight
+	cancelCaller()   // caller bails out mid-refresh
+	close(releaseRefresh)
+	<-done // the outer request may fail (caller ctx is dead) — that is fine
+
+	// The refresh itself must have completed and the rotated tokens persisted.
+	if savedAccess != "fresh-token" || savedRefresh != "fresh-rt" {
+		t.Fatalf("rotated tokens lost: access=%q refresh=%q", savedAccess, savedRefresh)
+	}
+	if got := refreshCount.Load(); got != 1 {
+		t.Fatalf("RefreshToken called %d times, want 1", got)
+	}
+}
+
+// Refresh-endpoint failure codes must not trigger another refresh:
+// 40140117 means rate-limited (access_token is not the problem) and
+// 40140120 means the refresh_token is dead (retry cannot help).
+func TestRefreshEndpointErrorsDoNotTriggerRefresh(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		code int64
+		msg  string
+	}{
+		{"refresh frequently", 40140117, "refresh frequently"},
+		{"refresh token error", 40140120, "refresh token error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var refreshCount atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/open/refreshToken":
+					refreshCount.Add(1)
+					writeJSON(w, map[string]any{"code": tc.code, "message": tc.msg})
+				case "/open/ufile/files":
+					writeJSON(w, map[string]any{
+						"state":   false,
+						"code":    tc.code,
+						"message": tc.msg,
+					})
+				default:
+					t.Errorf("unexpected path: %s", r.URL.Path)
+				}
+			}))
+			defer server.Close()
+
+			target, _ := url.Parse(server.URL)
+			client := New(WithAccessToken("some-token"), WithRefreshToken("some-rt"))
+			client.SetHttpClient(&http.Client{
+				Transport: &rewriteTransport{target: target, base: http.DefaultTransport},
+			})
+
+			_, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			var apiErr *Error
+			if !errors.As(err, &apiErr) || apiErr.Code != tc.code {
+				t.Fatalf("expected API error code %d, got: %v", tc.code, err)
+			}
+			if got := refreshCount.Load(); got != 0 {
+				t.Fatalf("RefreshToken called %d times, want 0", got)
+			}
+		})
+	}
+}
