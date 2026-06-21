@@ -377,6 +377,41 @@ func (f *FlexString) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// FlexInt64 can unmarshal an int64 from either a JSON number or a JSON string.
+// 115 endpoints are inconsistent about this — e.g. /open/video/play returns
+// file_size/duration as quoted strings — so numeric fields from such responses
+// must tolerate both shapes. null and the empty string decode to 0.
+type FlexInt64 int64
+
+func (f *FlexInt64) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 || string(data) == "null" {
+		*f = 0
+		return nil
+	}
+	if data[0] == '"' {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		if s == "" {
+			*f = 0
+			return nil
+		}
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return err
+		}
+		*f = FlexInt64(n)
+		return nil
+	}
+	var n int64
+	if err := json.Unmarshal(data, &n); err != nil {
+		return err
+	}
+	*f = FlexInt64(n)
+	return nil
+}
+
 type RbListResp_FileInfo struct {
 	ID         string `json:"id"`
 	FileName   string `json:"file_name"`
