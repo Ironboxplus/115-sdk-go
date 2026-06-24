@@ -45,3 +45,20 @@ func WithOnRefreshToken(fn func(accessToken string, refreshToken string)) Option
 		w.SetOnRefreshToken(fn)
 	}
 }
+
+// WithOnTokenValid registers a callback fired whenever an authenticated request
+// succeeds (the token in use is proven good).
+func WithOnTokenValid(fn func()) Option {
+	return func(w *Client) {
+		w.SetOnTokenValid(fn)
+	}
+}
+
+// WithOnTokenInvalid registers a callback fired when the refresh_token is found
+// dead (CodeRefreshTokenError) — the credential cannot self-heal and must be
+// re-authorized or recovered from a peer.
+func WithOnTokenInvalid(fn func()) Option {
+	return func(w *Client) {
+		w.SetOnTokenInvalid(fn)
+	}
+}

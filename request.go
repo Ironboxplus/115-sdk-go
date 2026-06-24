@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -53,12 +54,37 @@ func (c *Client) passportRequest(ctx context.Context, url, method string, respDa
 		return nil, err
 	}
 	if resp.Code != 0 {
-		return response, fmt.Errorf("code: %d, message: %s", resp.Code, resp.Message)
+		// Typed so callers (e.g. RefreshToken) can detect CodeRefreshTokenError.
+		return response, &Error{Code: int64(resp.Code), Message: resp.Message}
 	}
 	if resp.Error != "" {
 		return response, fmt.Errorf("error: %s, errno: %d", resp.Error, resp.Errno)
 	}
 	return response, nil
+}
+
+// fireTokenValid / fireTokenInvalid invoke the validity callbacks if registered.
+func (c *Client) fireTokenValid() {
+	if c.onTokenValid != nil {
+		c.onTokenValid()
+	}
+}
+
+func (c *Client) fireTokenInvalid() {
+	if c.onTokenInvalid != nil {
+		c.onTokenInvalid()
+	}
+}
+
+// notifyIfRefreshDead fires onTokenInvalid when a refresh attempt failed because
+// the refresh_token itself is dead (CodeRefreshTokenError) — the only error a
+// refresh cannot recover from. Throttling (CodeRefreshFrequently) is transient
+// and must NOT be treated as a dead token.
+func (c *Client) notifyIfRefreshDead(err error) {
+	var e *Error
+	if errors.As(err, &e) && e.Code == CodeRefreshTokenError {
+		c.fireTokenInvalid()
+	}
 }
 
 func (c *Client) authRequest(ctx context.Context, url, method string, respData any, extractData, retry bool, opts ...RestyOption) (*resty.Response, error) {
@@ -89,13 +115,22 @@ func (c *Client) authRequest(ctx context.Context, url, method string, respData a
 				cancel()
 				c.refreshMu.Unlock()
 				if err != nil {
+					// The refresh_token is dead — signal callers to recover it
+					// (re-auth / pull from a healthy peer) instead of looping.
+					c.notifyIfRefreshDead(err)
 					return response, err
 				}
 			}
 			return c.authRequest(ctx, url, method, respData, extractData, true, opts...)
 		}
+		if resp.Code == CodeRefreshTokenError {
+			// The API rejected us directly with a dead refresh_token.
+			c.fireTokenInvalid()
+		}
 		return response, &Error{Code: resp.Code, Message: resp.Message}
 	}
+	// The request authenticated successfully: the token in use is proven good.
+	c.fireTokenValid()
 	if respData != nil {
 		if extractData {
 			if isEmptyData(resp.Data) {

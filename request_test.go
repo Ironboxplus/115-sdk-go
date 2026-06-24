@@ -217,6 +217,117 @@ func ctx(t *testing.T) context.Context {
 	return context.Background()
 }
 
+// newTestClient wires a client to a local test server via the rewrite transport.
+func newTestClient(serverURL string, opts ...Option) *Client {
+	target, _ := url.Parse(serverURL)
+	c := New(opts...)
+	c.SetHttpClient(&http.Client{
+		Transport: &rewriteTransport{target: target, base: http.DefaultTransport},
+	})
+	return c
+}
+
+// A successful authenticated request must fire onTokenValid (and not invalid):
+// the token in use is proven good.
+func TestOnTokenValidFiresOnSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"state": true, "data": []any{}, "count": 0})
+	}))
+	defer server.Close()
+
+	var valid, invalid atomic.Int32
+	client := newTestClient(server.URL,
+		WithAccessToken("good-token"),
+		WithOnTokenValid(func() { valid.Add(1) }),
+		WithOnTokenInvalid(func() { invalid.Add(1) }),
+	)
+	if _, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if valid.Load() != 1 {
+		t.Fatalf("onTokenValid fired %d times, want 1", valid.Load())
+	}
+	if invalid.Load() != 0 {
+		t.Fatalf("onTokenInvalid fired %d times, want 0", invalid.Load())
+	}
+}
+
+// When the API rejects us directly with a dead refresh_token, onTokenInvalid
+// must fire so the caller can recover (re-auth / pull from a peer).
+func TestOnTokenInvalidFiresOnDirectDeadRefreshToken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"state": false, "code": CodeRefreshTokenError, "message": "refresh token error"})
+	}))
+	defer server.Close()
+
+	var valid, invalid atomic.Int32
+	client := newTestClient(server.URL,
+		WithAccessToken("dead"), WithRefreshToken("dead-rt"),
+		WithOnTokenValid(func() { valid.Add(1) }),
+		WithOnTokenInvalid(func() { invalid.Add(1) }),
+	)
+	_, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if invalid.Load() != 1 {
+		t.Fatalf("onTokenInvalid fired %d times, want 1", invalid.Load())
+	}
+	if valid.Load() != 0 {
+		t.Fatalf("onTokenValid fired %d times, want 0", valid.Load())
+	}
+}
+
+// When the access_token is expired and the refresh attempt then fails with a
+// dead refresh_token, onTokenInvalid must fire.
+func TestOnTokenInvalidFiresWhenRefreshDies(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open/refreshToken":
+			writeJSON(w, map[string]any{"code": CodeRefreshTokenError, "message": "refresh token error"})
+		default: // expired access token → triggers a refresh attempt
+			writeJSON(w, map[string]any{"state": false, "code": 40100000, "message": "expired"})
+		}
+	}))
+	defer server.Close()
+
+	var invalid atomic.Int32
+	client := newTestClient(server.URL,
+		WithAccessToken("expired"), WithRefreshToken("dead-rt"),
+		WithOnTokenInvalid(func() { invalid.Add(1) }),
+	)
+	if _, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil); err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if invalid.Load() != 1 {
+		t.Fatalf("onTokenInvalid fired %d times, want 1", invalid.Load())
+	}
+}
+
+// Refresh throttling (CodeRefreshFrequently) is transient — the refresh_token is
+// NOT dead — so onTokenInvalid must NOT fire.
+func TestOnTokenInvalidDoesNotFireOnThrottle(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open/refreshToken":
+			writeJSON(w, map[string]any{"code": CodeRefreshFrequently, "message": "refresh frequently"})
+		default:
+			writeJSON(w, map[string]any{"state": false, "code": 40100000, "message": "expired"})
+		}
+	}))
+	defer server.Close()
+
+	var invalid atomic.Int32
+	client := newTestClient(server.URL,
+		WithAccessToken("expired"), WithRefreshToken("live-rt"),
+		WithOnTokenInvalid(func() { invalid.Add(1) }),
+	)
+	_, _ = client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
+	if invalid.Load() != 0 {
+		t.Fatalf("onTokenInvalid fired %d times on throttle, want 0", invalid.Load())
+	}
+}
+
 // A refresh must complete even if the API request that triggered it is
 // canceled mid-refresh (e.g. a video player aborting a seek). Otherwise the
 // one-time refresh_token is consumed server-side while its replacement is

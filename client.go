@@ -14,6 +14,13 @@ type Client struct {
 	accessToken    string
 	refreshToken   string
 	onRefreshToken func(string, string)
+	// onTokenValid fires after any authenticated request succeeds, i.e. the token
+	// in use is proven good. onTokenInvalid fires when the refresh_token is found
+	// dead (CodeRefreshTokenError) and re-auth/peer-recovery is required. Both let
+	// callers track token validity (e.g. cluster sync: only share a proven-valid
+	// token; pull a fresh one from a peer when the local one dies).
+	onTokenValid   func()
+	onTokenInvalid func()
 	refreshMu      sync.Mutex
 }
 
@@ -70,6 +77,16 @@ func (w *Client) SetRefreshToken(token string) *Client {
 
 func (w *Client) SetOnRefreshToken(fn func(accessToken string, refreshToken string)) *Client {
 	w.onRefreshToken = fn
+	return w
+}
+
+func (w *Client) SetOnTokenValid(fn func()) *Client {
+	w.onTokenValid = fn
+	return w
+}
+
+func (w *Client) SetOnTokenInvalid(fn func()) *Client {
+	w.onTokenInvalid = fn
 	return w
 }
 
