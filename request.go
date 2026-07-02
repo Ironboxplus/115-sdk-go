@@ -18,6 +18,12 @@ import (
 // replacement is lost — permanently bricking authentication.
 const refreshTimeout = 30 * time.Second
 
+// refreshCooldown is how long to refuse further refresh attempts after 115's
+// passport endpoint answered 40140117 (refresh frequently). The limiter is
+// keyed to recent call rate; hammering it once per incoming request keeps it
+// tripped forever. During cooldown, callers fail fast with the original error.
+const refreshCooldown = 5 * time.Minute
+
 // shouldRefreshToken reports whether an API error code indicates a stale
 // access_token that a refresh could fix. Refresh-endpoint errors are excluded:
 //   - 40140117 (refresh frequently): rate-limited, the access_token is not the
@@ -87,6 +93,39 @@ func (c *Client) notifyIfRefreshDead(err error) {
 	}
 }
 
+// refreshAllowed reports whether a refresh attempt may be made right now.
+// It is false while the dead latch is set (refresh_token consumed/revoked)
+// or within the cooldown window after a 40140117 throttle.
+func (c *Client) refreshAllowed() bool {
+	c.gateMu.Lock()
+	defer c.gateMu.Unlock()
+	if c.refreshDead {
+		return false
+	}
+	return time.Now().After(c.refreshBlockedUntil)
+}
+
+// noteRefreshOutcome updates the refresh gate from a refresh attempt's result:
+// success clears everything; 40140117 arms the cooldown; 40140120 latches dead.
+func (c *Client) noteRefreshOutcome(err error) {
+	c.gateMu.Lock()
+	defer c.gateMu.Unlock()
+	if err == nil {
+		c.refreshDead = false
+		c.refreshBlockedUntil = time.Time{}
+		return
+	}
+	var e *Error
+	if errors.As(err, &e) {
+		switch e.Code {
+		case CodeRefreshFrequently:
+			c.refreshBlockedUntil = time.Now().Add(refreshCooldown)
+		case CodeRefreshTokenError:
+			c.refreshDead = true
+		}
+	}
+}
+
 func (c *Client) authRequest(ctx context.Context, url, method string, respData any, extractData, retry bool, opts ...RestyOption) (*resty.Response, error) {
 	var resp Resp[json.RawMessage]
 	c.refreshMu.Lock()
@@ -103,6 +142,14 @@ func (c *Client) authRequest(ctx context.Context, url, method string, respData a
 	}
 	if !resp.State {
 		if !retry && shouldRefreshToken(resp.Code) {
+			// Gate check outside the lock: while the dead latch or throttle
+			// cooldown is active, fail fast with the original API error instead
+			// of hitting the passport endpoint again. This is what stops a
+			// retrying caller (video player at 1 req/s) from feeding 115's
+			// refresh limiter forever.
+			if !c.refreshAllowed() {
+				return response, &Error{Code: resp.Code, Message: resp.Message}
+			}
 			c.refreshMu.Lock()
 			if c.accessToken != usedToken {
 				c.refreshMu.Unlock()
@@ -124,7 +171,11 @@ func (c *Client) authRequest(ctx context.Context, url, method string, respData a
 			return c.authRequest(ctx, url, method, respData, extractData, true, opts...)
 		}
 		if resp.Code == CodeRefreshTokenError {
-			// The API rejected us directly with a dead refresh_token.
+			// The API rejected us directly with a dead refresh_token — latch the
+			// gate so no later request wastes a passport call on it.
+			c.gateMu.Lock()
+			c.refreshDead = true
+			c.gateMu.Unlock()
 			c.fireTokenInvalid()
 		}
 		return response, &Error{Code: resp.Code, Message: resp.Message}

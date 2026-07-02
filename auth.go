@@ -82,6 +82,9 @@ func (c *Client) RefreshToken(ctx context.Context) (*RefreshTokenResp, error) {
 	_, err := c.passportRequest(ctx, ApiRefreshToken, http.MethodPost, &resp, ReqWithForm(Form{
 		"refresh_token": c.refreshToken,
 	}))
+	// Feed the refresh gate: a 40140117 arms a cooldown, a 40140120 latches the
+	// dead state until a new refresh_token is injected, success clears both.
+	c.noteRefreshOutcome(err)
 	if err != nil {
 		return nil, err
 	}

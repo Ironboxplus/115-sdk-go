@@ -212,6 +212,135 @@ func TestAuthRequestSucceedsForValidObject(t *testing.T) {
 	}
 }
 
+// After a 40140117 throttle on the refresh endpoint, subsequent requests must
+// fail fast WITHOUT hitting the passport endpoint again (cooldown gate). This
+// is the "frequent refresh" bug: a retrying caller (video player at ~1 req/s)
+// re-triggered a refresh per request and kept 115's limiter tripped forever.
+func TestRefreshCooldownStopsRepeatedRefreshAttempts(t *testing.T) {
+	var refreshCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open/refreshToken":
+			refreshCount.Add(1)
+			writeJSON(w, map[string]any{"code": CodeRefreshFrequently, "message": "refresh frequently"})
+		default: // expired access token → wants a refresh
+			writeJSON(w, map[string]any{"state": false, "code": 40100000, "message": "expired"})
+		}
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL, WithAccessToken("expired"), WithRefreshToken("live-rt"))
+
+	// First request: allowed to try the refresh once, gets throttled.
+	_, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if got := refreshCount.Load(); got != 1 {
+		t.Fatalf("RefreshToken called %d times after first request, want 1", got)
+	}
+
+	// Hammer 20 more requests (a seeking player). None may touch the passport
+	// endpoint during the cooldown; each fails fast with the API error.
+	for i := 0; i < 20; i++ {
+		_, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
+		if err == nil {
+			t.Fatalf("request %d: expected error, got nil", i)
+		}
+	}
+	if got := refreshCount.Load(); got != 1 {
+		t.Fatalf("RefreshToken called %d times total, want 1 (cooldown must block retries)", got)
+	}
+}
+
+// After a 40140120 (dead refresh_token) the gate latches: no further refresh
+// attempts ever — until a NEW refresh_token is injected, which re-opens it.
+func TestDeadRefreshTokenLatchesUntilNewTokenInjected(t *testing.T) {
+	var refreshCount atomic.Int32
+	rtIsDead := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open/refreshToken":
+			refreshCount.Add(1)
+			if rtIsDead {
+				writeJSON(w, map[string]any{"code": CodeRefreshTokenError, "message": "refresh token error"})
+				return
+			}
+			writeJSON(w, map[string]any{
+				"state": 1, "code": 0,
+				"data": map[string]any{"access_token": "fresh-at", "refresh_token": "fresh-rt", "expires_in": 7200},
+			})
+		case "/open/ufile/files":
+			if r.Header.Get("Authorization") == "Bearer fresh-at" {
+				writeJSON(w, map[string]any{"state": true, "data": []any{}, "count": 0})
+				return
+			}
+			writeJSON(w, map[string]any{"state": false, "code": 40100000, "message": "expired"})
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL, WithAccessToken("expired"), WithRefreshToken("dead-rt"))
+
+	// First request consumes the one allowed refresh attempt → dead latch.
+	if _, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil); err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if got := refreshCount.Load(); got != 1 {
+		t.Fatalf("RefreshToken called %d times, want 1", got)
+	}
+
+	// Latched: further requests never touch the passport endpoint.
+	for i := 0; i < 10; i++ {
+		_, _ = client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
+	}
+	if got := refreshCount.Load(); got != 1 {
+		t.Fatalf("RefreshToken called %d times while latched, want 1", got)
+	}
+
+	// Operator/cluster injects a fresh refresh_token → gate re-opens, refresh
+	// succeeds, request completes.
+	rtIsDead = false
+	client.SetRefreshToken("new-rt")
+	if _, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil); err != nil {
+		t.Fatalf("request after new RT injection failed: %v", err)
+	}
+	if got := refreshCount.Load(); got != 2 {
+		t.Fatalf("RefreshToken called %d times after new RT, want 2", got)
+	}
+}
+
+// A direct API answer of 40140120 (without going through a refresh attempt)
+// must also latch the gate.
+func TestDirectDeadRefreshTokenAnswerLatchesGate(t *testing.T) {
+	var refreshCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open/refreshToken":
+			refreshCount.Add(1)
+			writeJSON(w, map[string]any{"code": CodeRefreshTokenError, "message": "refresh token error"})
+		default:
+			// API answers the dead-RT code directly (115 does this on some endpoints).
+			writeJSON(w, map[string]any{"state": false, "code": CodeRefreshTokenError, "message": "refresh token error"})
+		}
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL, WithAccessToken("at"), WithRefreshToken("dead-rt"))
+
+	// shouldRefreshToken(40140120) is false, so no refresh fires — but the gate
+	// must still latch so a later 401-style error can't trigger one either.
+	_, _ = client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
+	if !client.refreshDead {
+		t.Fatal("gate not latched after direct 40140120 answer")
+	}
+	if got := refreshCount.Load(); got != 0 {
+		t.Fatalf("RefreshToken called %d times, want 0", got)
+	}
+}
+
 func ctx(t *testing.T) context.Context {
 	t.Helper()
 	return context.Background()
