@@ -10,11 +10,12 @@ var ErrObjectNotFound = errors.New("object not found")
 var ErrDataEmpty = errors.New("api returned empty data")
 
 const (
-	// CodeRefreshFrequently is returned when the refresh endpoint is rate-limited.
-	// The refresh_token is NOT consumed; retrying the refresh only feeds the limiter.
+	// CodeRefreshFrequently is returned when 115 rejects the credential chain for
+	// refresh frequency. The complete pair must be replaced from a peer or re-auth;
+	// AuthRequest never retries it locally.
 	CodeRefreshFrequently int64 = 40140117
-	// CodeRefreshTokenError means the stored refresh_token is dead (consumed or revoked).
-	// No amount of retrying can recover it; re-authorization is required.
+	// CodeRefreshTokenError means 115 rejected the credential chain while refreshing.
+	// No local retry can recover it; a peer replacement or re-authorization is required.
 	CodeRefreshTokenError int64 = 40140120
 )
 

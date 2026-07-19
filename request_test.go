@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,49 +30,16 @@ func writeJSON(w http.ResponseWriter, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-func TestConcurrentAuthRequestRefreshesOnlyOnce(t *testing.T) {
-	var refreshCount atomic.Int32
-	currentToken := "valid-token-1"
+func TestConcurrentAuthRequestOn401DoesNotRefresh(t *testing.T) {
+	var refreshCount, invalid atomic.Int32
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/open/refreshToken":
-			n := refreshCount.Add(1)
-			if n > 1 {
-				// Second+ refresh: 115 rejects because RT already consumed
-				writeJSON(w, map[string]any{
-					"code":    40140120,
-					"message": "refresh token error",
-				})
-				return
-			}
-			currentToken = "valid-token-2"
-			writeJSON(w, map[string]any{
-				"state": 1,
-				"code":  0,
-				"data": map[string]any{
-					"access_token":  currentToken,
-					"refresh_token": "new-rt",
-					"expires_in":    7200,
-				},
-			})
-
+			refreshCount.Add(1)
+			writeJSON(w, map[string]any{"state": 1, "code": 0})
 		case "/open/ufile/files":
-			tok := r.Header.Get("Authorization")
-			if tok != "Bearer "+currentToken {
-				// Expired token
-				writeJSON(w, map[string]any{
-					"state":   false,
-					"code":    40100000,
-					"message": "参数错误！",
-				})
-				return
-			}
-			writeJSON(w, map[string]any{
-				"state": true,
-				"data":  []any{},
-				"count": 0,
-			})
+			writeJSON(w, map[string]any{"state": false, "code": 40140125, "message": "access_token invalid"})
 
 		default:
 			t.Fatalf("unexpected path: %s", r.URL.Path)
@@ -83,36 +51,38 @@ func TestConcurrentAuthRequestRefreshesOnlyOnce(t *testing.T) {
 	client := New(
 		WithAccessToken("expired-token"),
 		WithRefreshToken("old-rt"),
+		WithOnTokenInvalid(func() { invalid.Add(1) }),
 	)
 	client.SetHttpClient(&http.Client{
 		Transport: &rewriteTransport{target: target, base: http.DefaultTransport},
 	})
 
-	// Fire 10 concurrent requests, all hitting expired token
+	// Concurrent 401s must produce one recovery signal and no local passport hit.
 	const goroutines = 10
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
-	errors := make([]error, goroutines)
+	errs := make([]error, goroutines)
 
 	for i := 0; i < goroutines; i++ {
 		go func(idx int) {
 			defer wg.Done()
 			_, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
-			errors[idx] = err
+			errs[idx] = err
 		}(i)
 	}
 	wg.Wait()
 
-	// With proper singleflight protection, refresh should be called exactly once.
-	// All 10 goroutines should succeed (using the refreshed token).
-	if n := refreshCount.Load(); n != 1 {
-		t.Fatalf("RefreshToken called %d times, want exactly 1", n)
+	if n := refreshCount.Load(); n != 0 {
+		t.Fatalf("RefreshToken called %d times, want 0", n)
 	}
-
-	for i, err := range errors {
-		if err != nil {
-			t.Errorf("goroutine %d failed: %v", i, err)
+	for i, err := range errs {
+		var apiErr *Error
+		if !errors.As(err, &apiErr) || apiErr.Code != 40140125 {
+			t.Errorf("goroutine %d error = %v, want 40140125", i, err)
 		}
+	}
+	if n := invalid.Load(); n != 1 {
+		t.Fatalf("onTokenInvalid fired %d times, want 1", n)
 	}
 }
 
@@ -212,18 +182,15 @@ func TestAuthRequestSucceedsForValidObject(t *testing.T) {
 	}
 }
 
-// After a 40140117 throttle on the refresh endpoint, subsequent requests must
-// fail fast WITHOUT hitting the passport endpoint again (cooldown gate). This
-// is the "frequent refresh" bug: a retrying caller (video player at ~1 req/s)
-// re-triggered a refresh per request and kept 115's limiter tripped forever.
-func TestRefreshCooldownStopsRepeatedRefreshAttempts(t *testing.T) {
+// Any 401 must skip the passport endpoint, including a retrying video caller.
+func TestAuthRequestNeverRefreshesAfter401(t *testing.T) {
 	var refreshCount atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/open/refreshToken":
 			refreshCount.Add(1)
 			writeJSON(w, map[string]any{"code": CodeRefreshFrequently, "message": "refresh frequently"})
-		default: // expired access token → wants a refresh
+		default:
 			writeJSON(w, map[string]any{"state": false, "code": 40100000, "message": "expired"})
 		}
 	}))
@@ -231,45 +198,35 @@ func TestRefreshCooldownStopsRepeatedRefreshAttempts(t *testing.T) {
 
 	client := newTestClient(server.URL, WithAccessToken("expired"), WithRefreshToken("live-rt"))
 
-	// First request: allowed to try the refresh once, gets throttled.
+	// The first 401 is immediately handed to peer recovery.
 	_, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if got := refreshCount.Load(); got != 1 {
-		t.Fatalf("RefreshToken called %d times after first request, want 1", got)
+	if got := refreshCount.Load(); got != 0 {
+		t.Fatalf("RefreshToken called %d times after first request, want 0", got)
 	}
 
-	// Hammer 20 more requests (a seeking player). None may touch the passport
-	// endpoint during the cooldown; each fails fast with the API error.
+	// Hammer 20 more requests (a seeking player). None may touch passport.
 	for i := 0; i < 20; i++ {
 		_, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
 		if err == nil {
 			t.Fatalf("request %d: expected error, got nil", i)
 		}
 	}
-	if got := refreshCount.Load(); got != 1 {
-		t.Fatalf("RefreshToken called %d times total, want 1 (cooldown must block retries)", got)
+	if got := refreshCount.Load(); got != 0 {
+		t.Fatalf("RefreshToken called %d times total, want 0", got)
 	}
 }
 
-// After a 40140120 (dead refresh_token) the gate latches: no further refresh
-// attempts ever — until a NEW refresh_token is injected, which re-opens it.
-func TestDeadRefreshTokenLatchesUntilNewTokenInjected(t *testing.T) {
+// A new peer-provided pair reopens the gate; AuthRequest still never refreshes.
+func TestPeerCredentialPairReopensDeadGate(t *testing.T) {
 	var refreshCount atomic.Int32
-	rtIsDead := true
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/open/refreshToken":
 			refreshCount.Add(1)
-			if rtIsDead {
-				writeJSON(w, map[string]any{"code": CodeRefreshTokenError, "message": "refresh token error"})
-				return
-			}
-			writeJSON(w, map[string]any{
-				"state": 1, "code": 0,
-				"data": map[string]any{"access_token": "fresh-at", "refresh_token": "fresh-rt", "expires_in": 7200},
-			})
+			writeJSON(w, map[string]any{"state": 1, "code": 0})
 		case "/open/ufile/files":
 			if r.Header.Get("Authorization") == "Bearer fresh-at" {
 				writeJSON(w, map[string]any{"state": true, "data": []any{}, "count": 0})
@@ -284,31 +241,30 @@ func TestDeadRefreshTokenLatchesUntilNewTokenInjected(t *testing.T) {
 
 	client := newTestClient(server.URL, WithAccessToken("expired"), WithRefreshToken("dead-rt"))
 
-	// First request consumes the one allowed refresh attempt → dead latch.
+	// First 401 latches without a refresh attempt.
 	if _, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil); err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if got := refreshCount.Load(); got != 1 {
-		t.Fatalf("RefreshToken called %d times, want 1", got)
+	if got := refreshCount.Load(); got != 0 {
+		t.Fatalf("RefreshToken called %d times, want 0", got)
 	}
 
 	// Latched: further requests never touch the passport endpoint.
 	for i := 0; i < 10; i++ {
 		_, _ = client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
 	}
-	if got := refreshCount.Load(); got != 1 {
-		t.Fatalf("RefreshToken called %d times while latched, want 1", got)
+	if got := refreshCount.Load(); got != 0 {
+		t.Fatalf("RefreshToken called %d times while latched, want 0", got)
 	}
 
-	// Operator/cluster injects a fresh refresh_token → gate re-opens, refresh
-	// succeeds, request completes.
-	rtIsDead = false
+	// Cluster injects the complete peer pair; no local refresh is needed.
+	client.SetAccessToken("fresh-at")
 	client.SetRefreshToken("new-rt")
 	if _, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil); err != nil {
-		t.Fatalf("request after new RT injection failed: %v", err)
+		t.Fatalf("request after peer pair injection failed: %v", err)
 	}
-	if got := refreshCount.Load(); got != 2 {
-		t.Fatalf("RefreshToken called %d times after new RT, want 2", got)
+	if got := refreshCount.Load(); got != 0 {
+		t.Fatalf("RefreshToken called %d times after peer pair injection, want 0", got)
 	}
 }
 
@@ -330,8 +286,8 @@ func TestDirectDeadRefreshTokenAnswerLatchesGate(t *testing.T) {
 
 	client := newTestClient(server.URL, WithAccessToken("at"), WithRefreshToken("dead-rt"))
 
-	// shouldRefreshToken(40140120) is false, so no refresh fires — but the gate
-	// must still latch so a later 401-style error can't trigger one either.
+	// Direct 40140120 latches the pair, so later requests cannot emit another
+	// recovery cycle or call the passport endpoint.
 	_, _ = client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
 	if !client.refreshDead {
 		t.Fatal("gate not latched after direct 40140120 answer")
@@ -433,105 +389,84 @@ func TestOnTokenInvalidFiresWhenRefreshDies(t *testing.T) {
 	}
 }
 
-// Refresh throttling (CodeRefreshFrequently) is transient — the refresh_token is
-// NOT dead — so onTokenInvalid must NOT fire.
-func TestOnTokenInvalidDoesNotFireOnThrottle(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/open/refreshToken":
-			writeJSON(w, map[string]any{"code": CodeRefreshFrequently, "message": "refresh frequently"})
-		default:
-			writeJSON(w, map[string]any{"state": false, "code": 40100000, "message": "expired"})
-		}
-	}))
-	defer server.Close()
+// A 115 401xxxxx response means this access/refresh-token pair is unusable.
+// AuthRequest must not make a local refresh attempt: the only recovery is to
+// notify the caller once so it can pull a replacement pair from a peer.
+func TestAny401LatchesPairAndNotifiesWithoutRefresh(t *testing.T) {
+	for _, code := range []int64{40100000, CodeRefreshFrequently, CodeRefreshTokenError, 40140125, 40140126} {
+		t.Run(strconv.FormatInt(code, 10), func(t *testing.T) {
+			var refreshCount, invalid atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/open/refreshToken" {
+					refreshCount.Add(1)
+					writeJSON(w, map[string]any{"state": 1, "code": 0})
+					return
+				}
+				writeJSON(w, map[string]any{"state": false, "code": code, "message": "token rejected"})
+			}))
+			defer server.Close()
 
-	var invalid atomic.Int32
-	client := newTestClient(server.URL,
-		WithAccessToken("expired"), WithRefreshToken("live-rt"),
-		WithOnTokenInvalid(func() { invalid.Add(1) }),
-	)
-	_, _ = client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
-	if invalid.Load() != 0 {
-		t.Fatalf("onTokenInvalid fired %d times on throttle, want 0", invalid.Load())
-	}
-}
-
-// A refresh must complete even if the API request that triggered it is
-// canceled mid-refresh (e.g. a video player aborting a seek). Otherwise the
-// one-time refresh_token is consumed server-side while its replacement is
-// lost in the aborted response.
-func TestRefreshSurvivesCallerCancellation(t *testing.T) {
-	var refreshCount atomic.Int32
-	refreshStarted := make(chan struct{})
-	releaseRefresh := make(chan struct{})
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/open/refreshToken":
-			refreshCount.Add(1)
-			close(refreshStarted)
-			<-releaseRefresh // hold the refresh in flight while caller cancels
-			writeJSON(w, map[string]any{
-				"state": 1,
-				"code":  0,
-				"data": map[string]any{
-					"access_token":  "fresh-token",
-					"refresh_token": "fresh-rt",
-					"expires_in":    7200,
-				},
-			})
-		case "/open/ufile/files":
-			if r.Header.Get("Authorization") == "Bearer fresh-token" {
-				writeJSON(w, map[string]any{"state": true, "data": []any{}, "count": 0})
-				return
+			client := newTestClient(server.URL,
+				WithAccessToken("rejected-at"),
+				WithRefreshToken("rejected-rt"),
+				WithOnTokenInvalid(func() { invalid.Add(1) }),
+			)
+			_, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
+			var apiErr *Error
+			if !errors.As(err, &apiErr) || apiErr.Code != code {
+				t.Fatalf("error = %v, want API code %d", err, code)
 			}
-			writeJSON(w, map[string]any{
-				"state":   false,
-				"code":    40100000,
-				"message": "token expired",
-			})
-		default:
-			t.Errorf("unexpected path: %s", r.URL.Path)
-		}
-	}))
-	defer server.Close()
+			if got := refreshCount.Load(); got != 0 {
+				t.Fatalf("RefreshToken called %d times, want 0", got)
+			}
+			if got := invalid.Load(); got != 1 {
+				t.Fatalf("onTokenInvalid fired %d times, want 1", got)
+			}
+			if !client.refreshDead {
+				t.Fatal("401 credential pair was not latched dead")
+			}
 
-	target, _ := url.Parse(server.URL)
-	var savedAccess, savedRefresh string
-	client := New(
-		WithAccessToken("expired-token"),
-		WithRefreshToken("old-rt"),
-		WithOnRefreshToken(func(at, rt string) { savedAccess, savedRefresh = at, rt }),
-	)
-	client.SetHttpClient(&http.Client{
-		Transport: &rewriteTransport{target: target, base: http.DefaultTransport},
-	})
+			for i := 0; i < 5; i++ {
+				_, _ = client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
+			}
+			if got := refreshCount.Load(); got != 0 {
+				t.Fatalf("RefreshToken called %d times after retries, want 0", got)
+			}
+			if got := invalid.Load(); got != 1 {
+				t.Fatalf("onTokenInvalid fired %d times after retries, want 1", got)
+			}
 
-	callerCtx, cancelCaller := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		_, err := client.AuthRequest(callerCtx, ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
-		done <- err
-	}()
-
-	<-refreshStarted // refresh request is now in flight
-	cancelCaller()   // caller bails out mid-refresh
-	close(releaseRefresh)
-	<-done // the outer request may fail (caller ctx is dead) — that is fine
-
-	// The refresh itself must have completed and the rotated tokens persisted.
-	if savedAccess != "fresh-token" || savedRefresh != "fresh-rt" {
-		t.Fatalf("rotated tokens lost: access=%q refresh=%q", savedAccess, savedRefresh)
-	}
-	if got := refreshCount.Load(); got != 1 {
-		t.Fatalf("RefreshToken called %d times, want 1", got)
+			client.SetRefreshToken("peer-replacement-rt")
+			if client.refreshDead {
+				t.Fatal("peer replacement did not reopen the credential gate")
+			}
+		})
 	}
 }
 
-// Refresh-endpoint failure codes must not trigger another refresh:
-// 40140117 means rate-limited (access_token is not the problem) and
-// 40140120 means the refresh_token is dead (retry cannot help).
+// A caller canceling an authenticated request cannot consume a refresh token:
+// AuthRequest never launches a passport refresh in the first place.
+func TestCanceledAuthRequestDoesNotStartRefresh(t *testing.T) {
+	var refreshCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/open/refreshToken" {
+			refreshCount.Add(1)
+		}
+		writeJSON(w, map[string]any{"state": false, "code": 40140125, "message": "access_token invalid"})
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL, WithAccessToken("rejected"), WithRefreshToken("rejected-rt"))
+	callerCtx, cancelCaller := context.WithCancel(context.Background())
+	cancelCaller()
+	_, _ = client.AuthRequest(callerCtx, ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
+	if got := refreshCount.Load(); got != 0 {
+		t.Fatalf("RefreshToken called %d times after caller cancellation, want 0", got)
+	}
+}
+
+// Direct refresh-endpoint errors are surfaced to an explicit RefreshToken caller;
+// AuthRequest itself never calls that endpoint after a 401.
 func TestRefreshEndpointErrorsDoNotTriggerRefresh(t *testing.T) {
 	for _, tc := range []struct {
 		name string

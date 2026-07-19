@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"sync"
-	"time"
 
 	"resty.dev/v3"
 )
@@ -16,26 +15,19 @@ type Client struct {
 	refreshToken   string
 	onRefreshToken func(string, string)
 	// onTokenValid fires after any authenticated request succeeds, i.e. the token
-	// in use is proven good. onTokenInvalid fires when the refresh_token is found
-	// dead (CodeRefreshTokenError) and re-auth/peer-recovery is required. Both let
-	// callers track token validity (e.g. cluster sync: only share a proven-valid
-	// token; pull a fresh one from a peer when the local one dies).
+	// pair in use is proven good. onTokenInvalid fires once when 115 returns any
+	// 401xxxxx response: that pair is not reusable and callers must recover a new
+	// one (for example from a cluster peer) rather than refreshing it locally.
 	onTokenValid   func()
 	onTokenInvalid func()
 	refreshMu      sync.Mutex
 
-	// Refresh gate — remembers refresh-endpoint failures across requests. Without
-	// it, every incoming API call that sees an expired access_token re-attempts a
-	// refresh; with a dead/rotated refresh_token that means one passport hit per
-	// caller request (a seeking video player = 1/sec), which trips 115's limiter
-	// (40140117) and then keeps it tripped indefinitely.
-	//   - refreshBlockedUntil: cooldown after 40140117 (limiter needs quiet time);
-	//   - refreshDead: latched after 40140120 (the refresh_token is gone — no
-	//     retry can help) until a new refresh_token is injected via
-	//     SetRefreshToken (manual re-auth or cluster credential sync).
-	gateMu              sync.Mutex
-	refreshBlockedUntil time.Time
-	refreshDead         bool
+	// Credential gate — any 401xxxxx latches the complete pair as dead. We never
+	// retry the passport refresh endpoint from AuthRequest; a new refresh_token
+	// injected by re-authentication or cluster recovery is the only way to reopen
+	// the gate.
+	gateMu      sync.Mutex
+	refreshDead bool
 }
 
 func New(opts ...Option) *Client {
@@ -86,11 +78,10 @@ func (w *Client) SetAccessToken(token string) *Client {
 
 func (w *Client) SetRefreshToken(token string) *Client {
 	w.gateMu.Lock()
-	// A new refresh_token is a fresh chain: clear the dead latch and cooldown so
-	// the next expired access_token may refresh again.
+	// A new refresh_token is a fresh pair: clear the dead latch and cooldown so
+	// authenticated requests may use it again.
 	if token != w.refreshToken {
 		w.refreshDead = false
-		w.refreshBlockedUntil = time.Time{}
 	}
 	w.gateMu.Unlock()
 	w.refreshToken = token
