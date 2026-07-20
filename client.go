@@ -20,10 +20,11 @@ type Client struct {
 	// dead (CodeRefreshTokenError) and re-auth/peer-recovery is required. Both let
 	// callers track token validity (e.g. cluster sync: only share a proven-valid
 	// token; pull a fresh one from a peer when the local one dies).
-	onTokenValid       func()
-	onAccessTokenValid func(string)
-	onTokenInvalid     func()
-	refreshMu          sync.Mutex
+	onTokenValid         func()
+	onAccessTokenValid   func(string)
+	onAccessTokenInvalid func(string)
+	onTokenInvalid       func()
+	refreshMu            sync.Mutex
 
 	// Refresh gate — remembers refresh-endpoint failures across requests. Without
 	// it, every incoming API call that sees an expired access_token re-attempts a
@@ -113,6 +114,13 @@ func (w *Client) SetOnTokenValid(fn func()) *Client {
 // credential generation after a concurrent refresh or peer replacement.
 func (w *Client) SetOnAccessTokenValid(fn func(accessToken string)) *Client {
 	w.onAccessTokenValid = fn
+	return w
+}
+
+// SetOnAccessTokenInvalid reports the exact access token attached to the
+// request whose credential chain was rejected.
+func (w *Client) SetOnAccessTokenInvalid(fn func(accessToken string)) *Client {
+	w.onAccessTokenInvalid = fn
 	return w
 }
 

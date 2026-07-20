@@ -60,6 +60,12 @@ func WithOnAccessTokenValid(fn func(accessToken string)) Option {
 	}
 }
 
+func WithOnAccessTokenInvalid(fn func(accessToken string)) Option {
+	return func(w *Client) {
+		w.SetOnAccessTokenInvalid(fn)
+	}
+}
+
 // WithOnTokenInvalid registers a callback fired when the refresh_token is found
 // dead (CodeRefreshTokenError) — the credential cannot self-heal and must be
 // re-authorized or recovered from a peer.

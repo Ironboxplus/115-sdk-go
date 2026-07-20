@@ -83,17 +83,24 @@ func (c *Client) fireTokenInvalid() {
 	}
 }
 
+func (c *Client) fireAccessTokenInvalid(accessToken string) {
+	if c.onAccessTokenInvalid != nil {
+		c.onAccessTokenInvalid(accessToken)
+	}
+}
+
 // markTokenDead latches one rejected pair and emits one recovery signal.
-func (c *Client) markTokenDead() {
+func (c *Client) markTokenDead() bool {
 	c.gateMu.Lock()
 	if c.refreshDead {
 		c.gateMu.Unlock()
-		return
+		return false
 	}
 	c.refreshDead = true
 	c.refreshBlockedUntil = time.Time{}
 	c.gateMu.Unlock()
 	c.fireTokenInvalid()
+	return true
 }
 
 // refreshAllowed reports whether a refresh attempt may be made right now.
@@ -164,6 +171,10 @@ func (c *Client) authRequest(ctx context.Context, url, method string, respData a
 				c.refreshMu.Unlock()
 				if err != nil {
 					// RefreshToken already latched and signaled any 401.
+					var apiErr *Error
+					if errors.As(err, &apiErr) && Is401Started(apiErr.Code) {
+						c.fireAccessTokenInvalid(usedToken)
+					}
 					return response, err
 				}
 			}
@@ -172,7 +183,9 @@ func (c *Client) authRequest(ctx context.Context, url, method string, respData a
 		if Is401Started(resp.Code) {
 			// A direct 40140117/40140120, or a second 401 after refresh,
 			// proves the complete pair unusable.
-			c.markTokenDead()
+			if c.markTokenDead() {
+				c.fireAccessTokenInvalid(usedToken)
+			}
 		}
 		return response, &Error{Code: resp.Code, Message: resp.Message}
 	}

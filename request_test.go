@@ -423,6 +423,52 @@ func TestOnAccessTokenValidReportsRefreshedToken(t *testing.T) {
 	}
 }
 
+func TestOnAccessTokenInvalidReportsCurrentRefreshedGeneration(t *testing.T) {
+	var rejectFresh atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open/refreshToken":
+			writeJSON(w, map[string]any{
+				"state": 1,
+				"code":  0,
+				"data": map[string]any{
+					"access_token":  "fresh-access",
+					"refresh_token": "fresh-refresh",
+					"expires_in":    7200,
+				},
+			})
+		default:
+			if r.Header.Get("Authorization") != "Bearer fresh-access" {
+				writeJSON(w, map[string]any{"state": false, "code": 40140125, "message": "access_token invalid"})
+				return
+			}
+			if rejectFresh.Load() {
+				writeJSON(w, map[string]any{"state": false, "code": CodeRefreshTokenError, "message": "refresh token error"})
+				return
+			}
+			writeJSON(w, map[string]any{"state": true, "data": []any{}, "count": 0})
+		}
+	}))
+	defer server.Close()
+
+	var invalidAccess string
+	client := newTestClient(server.URL,
+		WithAccessToken("expired-access"),
+		WithRefreshToken("live-refresh"),
+		WithOnAccessTokenInvalid(func(accessToken string) { invalidAccess = accessToken }),
+	)
+	if _, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil); err != nil {
+		t.Fatalf("initial refresh/retry failed: %v", err)
+	}
+	rejectFresh.Store(true)
+	if _, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil); err == nil {
+		t.Fatal("expected refreshed generation to be rejected")
+	}
+	if invalidAccess != "fresh-access" {
+		t.Fatalf("invalid callback access token = %q, want current refreshed generation", invalidAccess)
+	}
+}
+
 // When the API rejects us directly with a dead refresh_token, onTokenInvalid
 // must fire so the caller can recover (re-auth / pull from a peer).
 func TestOnTokenInvalidFiresOnDirectDeadRefreshToken(t *testing.T) {
