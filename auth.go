@@ -82,8 +82,10 @@ func (c *Client) RefreshToken(ctx context.Context) (*RefreshTokenResp, error) {
 	_, err := c.passportRequest(ctx, ApiRefreshToken, http.MethodPost, &resp, ReqWithForm(Form{
 		"refresh_token": c.refreshToken,
 	}))
+	// Any refresh-endpoint 401, including 40140117, latches the complete pair
+	// dead. Transient transport failures only arm a low-frequency cooldown.
+	c.noteRefreshOutcome(err)
 	if err != nil {
-		c.markTokenInvalidForError(err)
 		return nil, err
 	}
 	c.SetAccessToken(resp.AccessToken)
