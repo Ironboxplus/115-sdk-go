@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type rewriteTransport struct {
@@ -250,6 +251,22 @@ func TestRefreshCooldownStopsRepeatedRefreshAttempts(t *testing.T) {
 	}
 	if got := refreshCount.Load(); got != 1 {
 		t.Fatalf("RefreshToken called %d times total, want 1 (cooldown must block retries)", got)
+	}
+	if client.refreshDead {
+		t.Fatal("40140117 latched a retryable credential pair dead")
+	}
+
+	// Once the cooldown elapses, the same refresh chain is eligible for one
+	// more attempt. Move the clock gate instead of sleeping for five minutes.
+	client.gateMu.Lock()
+	client.refreshBlockedUntil = time.Now().Add(-time.Second)
+	client.gateMu.Unlock()
+	_, _ = client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
+	if got := refreshCount.Load(); got != 2 {
+		t.Fatalf("RefreshToken called %d times after cooldown, want 2", got)
+	}
+	if client.refreshDead {
+		t.Fatal("repeated 40140117 latched the credential pair dead")
 	}
 }
 
@@ -521,9 +538,9 @@ func TestOnTokenInvalidFiresWhenRefreshDies(t *testing.T) {
 	}
 }
 
-// A refresh-endpoint 40140117 rejects the complete chain. It must fire one
-// invalidation so the caller replaces the pair from a peer, never retries.
-func TestOnTokenInvalidFiresAndLatchesOnRefreshFrequently(t *testing.T) {
+// A refresh-endpoint 40140117 is a temporary throttle. It must not invalidate
+// the access/refresh pair or ask cluster recovery to tombstone that pair.
+func TestRefreshFrequentlyDoesNotInvalidateOrLatchPair(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/open/refreshToken":
@@ -535,16 +552,24 @@ func TestOnTokenInvalidFiresAndLatchesOnRefreshFrequently(t *testing.T) {
 	defer server.Close()
 
 	var invalid atomic.Int32
+	var invalidAccess atomic.Int32
 	client := newTestClient(server.URL,
 		WithAccessToken("expired"), WithRefreshToken("live-rt"),
 		WithOnTokenInvalid(func() { invalid.Add(1) }),
+		WithOnAccessTokenInvalid(func(string) { invalidAccess.Add(1) }),
 	)
 	_, _ = client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
-	if invalid.Load() != 1 {
-		t.Fatalf("onTokenInvalid fired %d times on 40140117, want 1", invalid.Load())
+	if invalid.Load() != 0 {
+		t.Fatalf("onTokenInvalid fired %d times on 40140117, want 0", invalid.Load())
 	}
-	if !client.refreshDead {
-		t.Fatal("40140117 did not latch the credential pair dead")
+	if invalidAccess.Load() != 0 {
+		t.Fatalf("onAccessTokenInvalid fired %d times on 40140117, want 0", invalidAccess.Load())
+	}
+	if client.refreshDead {
+		t.Fatal("40140117 latched the credential pair dead")
+	}
+	if !client.refreshBlockedUntil.After(time.Now()) {
+		t.Fatal("40140117 did not arm the refresh cooldown")
 	}
 }
 

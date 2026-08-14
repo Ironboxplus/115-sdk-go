@@ -31,9 +31,10 @@ type Client struct {
 	// refresh; with a dead/rotated refresh_token that means one passport hit per
 	// caller request (a seeking video player = 1/sec), which trips 115's limiter
 	// (40140117) and then keeps it tripped indefinitely.
-	//   - refreshBlockedUntil: cooldown after transient transport/server errors;
-	//   - refreshDead: latched after any refresh-endpoint 401, including
-	//     40140117, until a new refresh_token is injected via
+	//   - refreshBlockedUntil: cooldown after transient transport/server errors
+	//     or a 40140117 refresh-throttle response;
+	//   - refreshDead: latched after a terminal refresh-endpoint 401 (but not the
+	//     temporary 40140117 throttle) until a new refresh_token is injected via
 	//     SetRefreshToken (manual re-auth or cluster credential sync).
 	gateMu              sync.Mutex
 	refreshBlockedUntil time.Time

@@ -19,20 +19,28 @@ import (
 const refreshTimeout = 30 * time.Second
 
 // refreshCooldown is how long to refuse another refresh after a transient
-// transport/server failure. Refresh-endpoint 401s do not enter cooldown: they
-// permanently latch the pair dead until a peer or operator replaces it.
+// transport/server failure or a 40140117 refresh-throttle response. Terminal
+// refresh-endpoint 401s permanently latch the pair dead until a peer or
+// operator replaces it.
 const refreshCooldown = 5 * time.Minute
 
 // shouldRefreshToken reports whether an API error code indicates a stale
 // access_token that a refresh could fix. Refresh-endpoint errors are excluded:
-//   - 40140117 (refresh frequently): the refresh chain is rejected and this
-//     pair must be replaced rather than retried;
+//   - 40140117 (refresh frequently): the refresh endpoint is temporarily
+//     throttled and the same pair may be retried after cooldown;
 //   - 40140120 (refresh token error): the refresh_token itself is dead.
 func shouldRefreshToken(code int64) bool {
 	if code == CodeRefreshFrequently || code == CodeRefreshTokenError {
 		return false
 	}
 	return code == 99 || Is401Started(code)
+}
+
+// isTerminalAuthError distinguishes a rejected credential chain from 115's
+// temporary refresh throttle. A throttled refresh must not evict a pair that
+// may still rotate successfully after the provider's cooldown window.
+func isTerminalAuthError(code int64) bool {
+	return code != CodeRefreshFrequently && Is401Started(code)
 }
 
 func isEmptyData(data json.RawMessage) bool {
@@ -114,8 +122,9 @@ func (c *Client) refreshAllowed() bool {
 	return time.Now().After(c.refreshBlockedUntil)
 }
 
-// noteRefreshOutcome treats every refresh-endpoint 401, including 40140117, as
-// proof that the complete pair is dead. Non-auth failures only arm a cooldown.
+// noteRefreshOutcome keeps 40140117 retryable and treats the remaining
+// refresh-endpoint 401s as proof that the complete pair is dead. Transport,
+// server, and throttle failures only arm a cooldown.
 func (c *Client) noteRefreshOutcome(err error) {
 	if err == nil {
 		c.gateMu.Lock()
@@ -125,9 +134,17 @@ func (c *Client) noteRefreshOutcome(err error) {
 		return
 	}
 	var e *Error
-	if errors.As(err, &e) && Is401Started(e.Code) {
-		c.markTokenDead()
-		return
+	if errors.As(err, &e) {
+		if e.Code == CodeRefreshFrequently {
+			c.gateMu.Lock()
+			c.refreshBlockedUntil = time.Now().Add(refreshCooldown)
+			c.gateMu.Unlock()
+			return
+		}
+		if Is401Started(e.Code) {
+			c.markTokenDead()
+			return
+		}
 	}
 	c.gateMu.Lock()
 	c.refreshBlockedUntil = time.Now().Add(refreshCooldown)
@@ -170,9 +187,10 @@ func (c *Client) authRequest(ctx context.Context, url, method string, respData a
 				cancel()
 				c.refreshMu.Unlock()
 				if err != nil {
-					// RefreshToken already latched and signaled any 401.
+					// RefreshToken already applied either the terminal dead latch
+					// or the retryable 40140117 cooldown.
 					var apiErr *Error
-					if errors.As(err, &apiErr) && Is401Started(apiErr.Code) {
+					if errors.As(err, &apiErr) && isTerminalAuthError(apiErr.Code) {
 						c.fireAccessTokenInvalid(usedToken)
 					}
 					return response, err
@@ -180,9 +198,10 @@ func (c *Client) authRequest(ctx context.Context, url, method string, respData a
 			}
 			return c.authRequest(ctx, url, method, respData, extractData, true, opts...)
 		}
-		if Is401Started(resp.Code) {
-			// A direct 40140117/40140120, or a second 401 after refresh,
-			// proves the complete pair unusable.
+		if isTerminalAuthError(resp.Code) {
+			// A direct terminal auth error, or a second terminal 401 after
+			// refresh, proves the complete pair unusable. A 40140117 throttle
+			// remains retryable after cooldown.
 			if c.markTokenDead() {
 				c.fireAccessTokenInvalid(usedToken)
 			}
