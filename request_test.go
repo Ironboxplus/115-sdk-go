@@ -32,7 +32,11 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 func TestConcurrentAuthRequestRefreshesOnlyOnce(t *testing.T) {
 	var refreshCount atomic.Int32
-	currentToken := "valid-token-1"
+	// atomic.Value, not a bare string: the httptest server handles each
+	// concurrent connection on its own goroutine, so the refresh path's
+	// write here races with the ufile path's read on every other goroutine.
+	var currentToken atomic.Value
+	currentToken.Store("valid-token-1")
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -46,12 +50,12 @@ func TestConcurrentAuthRequestRefreshesOnlyOnce(t *testing.T) {
 				})
 				return
 			}
-			currentToken = "valid-token-2"
+			currentToken.Store("valid-token-2")
 			writeJSON(w, map[string]any{
 				"state": 1,
 				"code":  0,
 				"data": map[string]any{
-					"access_token":  currentToken,
+					"access_token":  currentToken.Load().(string),
 					"refresh_token": "new-rt",
 					"expires_in":    7200,
 				},
@@ -59,7 +63,7 @@ func TestConcurrentAuthRequestRefreshesOnlyOnce(t *testing.T) {
 
 		case "/open/ufile/files":
 			tok := r.Header.Get("Authorization")
-			if tok != "Bearer "+currentToken {
+			if tok != "Bearer "+currentToken.Load().(string) {
 				// Expired token
 				writeJSON(w, map[string]any{
 					"state":   false,
@@ -694,5 +698,374 @@ func TestRefreshEndpointErrorsDoNotTriggerRefresh(t *testing.T) {
 				t.Fatalf("RefreshToken called %d times, want 0", got)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Bug 1: the refresh-gate short-circuit (request.go, "if !c.refreshAllowed()")
+// must still report a terminal auth error before it fast-fails. Otherwise a
+// client that hits the gate before ever reaching the isTerminalAuthError
+// branch below it never tells anyone its credential is dead.
+// ---------------------------------------------------------------------------
+
+// White-box: force the dead latch directly (bypassing how it normally gets
+// set) to isolate the short-circuit branch itself, and assert both the gate
+// state and the callback behavior.
+func TestGateClosedByDeadLatchStillFiresAccessTokenInvalid(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/open/refreshToken" {
+			// t.Error, not t.Fatal: this callback runs on the http server's
+			// own goroutine, and FailNow (which Fatal calls) must only be
+			// called from the test's own goroutine.
+			t.Error("refresh endpoint must not be hit while the dead latch is set")
+		}
+		writeJSON(w, map[string]any{"state": false, "code": 40140125, "message": "access_token invalid"})
+	}))
+	defer server.Close()
+
+	var invalidCount atomic.Int32
+	var invalidAccess string
+	client := newTestClient(server.URL,
+		WithAccessToken("stuck-token"), WithRefreshToken("dead-rt"),
+		WithOnAccessTokenInvalid(func(at string) { invalidAccess = at; invalidCount.Add(1) }),
+	)
+	client.gateMu.Lock()
+	client.refreshDead = true
+	client.gateMu.Unlock()
+
+	if client.refreshAllowed() {
+		t.Fatal("refreshAllowed() true with the dead latch set")
+	}
+
+	_, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if invalidCount.Load() != 1 {
+		t.Fatalf("onAccessTokenInvalid fired %d times, want 1", invalidCount.Load())
+	}
+	if invalidAccess != "stuck-token" {
+		t.Fatalf("onAccessTokenInvalid token = %q, want %q", invalidAccess, "stuck-token")
+	}
+}
+
+// Same short-circuit branch, reached via the cooldown timer instead of the
+// dead latch.
+func TestGateClosedByCooldownStillFiresAccessTokenInvalid(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/open/refreshToken" {
+			t.Error("refresh endpoint must not be hit while the cooldown is active")
+		}
+		writeJSON(w, map[string]any{"state": false, "code": 40140125, "message": "access_token invalid"})
+	}))
+	defer server.Close()
+
+	var invalidCount atomic.Int32
+	var invalidAccess string
+	client := newTestClient(server.URL,
+		WithAccessToken("cooling-token"), WithRefreshToken("live-rt"),
+		WithOnAccessTokenInvalid(func(at string) { invalidAccess = at; invalidCount.Add(1) }),
+	)
+	client.gateMu.Lock()
+	client.refreshBlockedUntil = time.Now().Add(time.Minute)
+	client.gateMu.Unlock()
+
+	if client.refreshAllowed() {
+		t.Fatal("refreshAllowed() true during cooldown")
+	}
+
+	_, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if invalidCount.Load() != 1 {
+		t.Fatalf("onAccessTokenInvalid fired %d times, want 1", invalidCount.Load())
+	}
+	if invalidAccess != "cooling-token" {
+		t.Fatalf("onAccessTokenInvalid token = %q, want %q", invalidAccess, "cooling-token")
+	}
+}
+
+// Control case for the third gate state (neither latch nor cooldown set):
+// the short-circuit branch is not even reached -- the request proceeds to a
+// real refresh attempt. This is not expected to fail before the fix; it
+// characterizes the boundary the other two tests are probing.
+func TestGateOpenTakesRefreshPathNotShortCircuit(t *testing.T) {
+	var refreshCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open/refreshToken":
+			refreshCount.Add(1)
+			writeJSON(w, map[string]any{"code": CodeRefreshTokenError, "message": "refresh token error"})
+		default:
+			writeJSON(w, map[string]any{"state": false, "code": 40140125, "message": "access_token invalid"})
+		}
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL, WithAccessToken("expired"), WithRefreshToken("live-rt"))
+
+	if !client.refreshAllowed() {
+		t.Fatal("refreshAllowed() false on a fresh client with no latch/cooldown")
+	}
+
+	_, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if got := refreshCount.Load(); got != 1 {
+		t.Fatalf("refresh endpoint hit %d times, want 1 (gate was open)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Bug 2: fireAccessTokenInvalid must be level-triggered -- every rejected
+// request reports, not just the one that flips markTokenDead's return value
+// from true to false. A consumer with its own generation check can silently
+// drop one delivery; if that is the only one ever sent, the client is muted
+// for the rest of its process lifetime.
+// ---------------------------------------------------------------------------
+
+// Gray-box: gate pre-closed via the dead latch, then N consecutive 401s.
+// Asserts the exact request sequence: zero hits on the refresh endpoint, and
+// one onAccessTokenInvalid call per rejected request (not one total).
+func TestGateClosedFiresAccessTokenInvalidOncePerRequestNotJustFirst(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/open/refreshToken" {
+			t.Error("refresh endpoint must not be hit while the gate is closed")
+		}
+		writeJSON(w, map[string]any{"state": false, "code": 40140125, "message": "access_token invalid"})
+	}))
+	defer server.Close()
+
+	var mu sync.Mutex
+	var seenTokens []string
+	client := newTestClient(server.URL,
+		WithAccessToken("stuck-token"), WithRefreshToken("dead-rt"),
+		WithOnAccessTokenInvalid(func(at string) {
+			mu.Lock()
+			seenTokens = append(seenTokens, at)
+			mu.Unlock()
+		}),
+	)
+	client.gateMu.Lock()
+	client.refreshDead = true
+	client.gateMu.Unlock()
+
+	const n = 5
+	for i := 0; i < n; i++ {
+		if _, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil); err == nil {
+			t.Fatalf("request %d: expected error, got nil", i)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seenTokens) != n {
+		t.Fatalf("onAccessTokenInvalid fired %d times, want %d (must fire once per rejected request, not just the first)", len(seenTokens), n)
+	}
+	for i, tok := range seenTokens {
+		if tok != "stuck-token" {
+			t.Fatalf("call %d token = %q, want %q", i, tok, "stuck-token")
+		}
+	}
+}
+
+// Gray-box, isolating the OTHER call site of fireAccessTokenInvalid
+// (request.go's terminal-error block guarded by markTokenDead), reached
+// without ever touching the gate-check branch: a direct 40140120 answer
+// skips shouldRefreshToken (it excludes that code explicitly), so every one
+// of these requests falls straight through to the markTokenDead gating this
+// bug is about.
+func TestDirectDeadRefreshTokenAnswerFiresOnEveryRequestNotJustFirst(t *testing.T) {
+	var refreshCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/open/refreshToken" {
+			refreshCount.Add(1)
+		}
+		writeJSON(w, map[string]any{"state": false, "code": CodeRefreshTokenError, "message": "refresh token error"})
+	}))
+	defer server.Close()
+
+	var mu sync.Mutex
+	var seenTokens []string
+	client := newTestClient(server.URL,
+		WithAccessToken("direct-dead-token"), WithRefreshToken("dead-rt"),
+		WithOnAccessTokenInvalid(func(at string) {
+			mu.Lock()
+			seenTokens = append(seenTokens, at)
+			mu.Unlock()
+		}),
+	)
+
+	const n = 4
+	for i := 0; i < n; i++ {
+		if _, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil); err == nil {
+			t.Fatalf("request %d: expected error, got nil", i)
+		}
+	}
+
+	if got := refreshCount.Load(); got != 0 {
+		t.Fatalf("refresh endpoint hit %d times, want 0 (40140120 is excluded from shouldRefreshToken)", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seenTokens) != n {
+		t.Fatalf("onAccessTokenInvalid fired %d times, want %d (must fire on every request, not just the one that flips the latch)", len(seenTokens), n)
+	}
+	for i, tok := range seenTokens {
+		if tok != "direct-dead-token" {
+			t.Fatalf("call %d token = %q, want %q", i, tok, "direct-dead-token")
+		}
+	}
+}
+
+// Concurrency: the level-triggered guarantee must hold under concurrent
+// callers too -- every goroutine's rejected request produces exactly one
+// callback call, with no lost or duplicated deliveries. Run with -race.
+func TestConcurrentGateClosedFiresAccessTokenInvalidForEveryRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/open/refreshToken" {
+			t.Error("refresh endpoint must not be hit while the gate is closed")
+			return
+		}
+		writeJSON(w, map[string]any{"state": false, "code": 40140125, "message": "access_token invalid"})
+	}))
+	defer server.Close()
+
+	var invalidCount atomic.Int32
+	client := newTestClient(server.URL,
+		WithAccessToken("stuck-token"), WithRefreshToken("dead-rt"),
+		WithOnAccessTokenInvalid(func(string) { invalidCount.Add(1) }),
+	)
+	client.gateMu.Lock()
+	client.refreshDead = true
+	client.gateMu.Unlock()
+
+	const goroutines = 20
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			_, _ = client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil)
+		}()
+	}
+	wg.Wait()
+
+	if got := invalidCount.Load(); got != goroutines {
+		t.Fatalf("onAccessTokenInvalid fired %d times, want %d (one per rejected request)", got, goroutines)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Black-box: drives the client only through sdk.New(...) + AuthRequest,
+// touching no unexported field. Covers both bugs together across a realistic
+// end-to-end credential-death scenario.
+// ---------------------------------------------------------------------------
+
+// Full lifecycle: valid-looking initial token -> 401 -> refresh succeeds ->
+// the refreshed token ALSO gets 401'd on retry (proving the pair, not just
+// the access_token, is dead) -> latched -> every subsequent request must
+// keep reporting onAccessTokenInvalid, not just the first.
+func TestBlackBoxAccessTokenInvalidKeepsReportingAfterLatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open/refreshToken":
+			writeJSON(w, map[string]any{
+				"state": 1, "code": 0,
+				"data": map[string]any{"access_token": "new-at", "refresh_token": "new-rt", "expires_in": 7200},
+			})
+		default:
+			// Both the original and the refreshed token are rejected: the
+			// whole pair is dead, not just a stale access_token.
+			writeJSON(w, map[string]any{"state": false, "code": 40140125, "message": "access_token invalid"})
+		}
+	}))
+	defer server.Close()
+
+	var mu sync.Mutex
+	var seenTokens []string
+	client := New(WithAccessToken("old-at"), WithRefreshToken("old-rt"),
+		WithOnAccessTokenInvalid(func(at string) {
+			mu.Lock()
+			seenTokens = append(seenTokens, at)
+			mu.Unlock()
+		}),
+	)
+	target, _ := url.Parse(server.URL)
+	client.SetHttpClient(&http.Client{Transport: &rewriteTransport{target: target, base: http.DefaultTransport}})
+
+	// First call: 401 on old-at -> refresh succeeds -> retry with new-at ->
+	// also 401 -> latches, fires once (retry=true path).
+	if _, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil); err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	// Further top-level calls must keep reporting even though the gate is
+	// now closed (short-circuit path).
+	const moreCalls = 4
+	for i := 0; i < moreCalls; i++ {
+		if _, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil); err == nil {
+			t.Fatalf("call %d: expected error, got nil", i)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	wantCalls := 1 + moreCalls
+	if len(seenTokens) != wantCalls {
+		t.Fatalf("onAccessTokenInvalid fired %d times, want %d (must keep reporting after the latch closes)", len(seenTokens), wantCalls)
+	}
+	for i, tok := range seenTokens {
+		if tok != "new-at" {
+			t.Fatalf("call %d token = %q, want %q", i, tok, "new-at")
+		}
+	}
+}
+
+// The refresh endpoint itself answering with the dead-refresh_token code
+// must fire the callback with the token that was actually in use, and keep
+// firing on later requests instead of going silent after the first.
+func TestBlackBoxRefreshEndpointDeadTokenFiresCallbackWithCorrectToken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open/refreshToken":
+			writeJSON(w, map[string]any{"code": CodeRefreshTokenError, "message": "refresh token error"})
+		default:
+			writeJSON(w, map[string]any{"state": false, "code": 40100000, "message": "expired"})
+		}
+	}))
+	defer server.Close()
+
+	var mu sync.Mutex
+	var seenTokens []string
+	client := New(WithAccessToken("expired-at"), WithRefreshToken("dead-rt"),
+		WithOnAccessTokenInvalid(func(at string) {
+			mu.Lock()
+			seenTokens = append(seenTokens, at)
+			mu.Unlock()
+		}),
+	)
+	target, _ := url.Parse(server.URL)
+	client.SetHttpClient(&http.Client{Transport: &rewriteTransport{target: target, base: http.DefaultTransport}})
+
+	const calls = 3
+	for i := 0; i < calls; i++ {
+		if _, err := client.AuthRequest(ctx(t), ApiBaseURL+"/open/ufile/files", http.MethodGet, nil); err == nil {
+			t.Fatalf("call %d: expected error, got nil", i)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seenTokens) != calls {
+		t.Fatalf("onAccessTokenInvalid fired %d times, want %d", len(seenTokens), calls)
+	}
+	for i, tok := range seenTokens {
+		if tok != "expired-at" {
+			t.Fatalf("call %d token = %q, want %q", i, tok, "expired-at")
+		}
 	}
 }

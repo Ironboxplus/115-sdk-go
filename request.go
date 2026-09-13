@@ -173,6 +173,14 @@ func (c *Client) authRequest(ctx context.Context, url, method string, respData a
 			// retrying caller (video player at 1 req/s) from feeding 115's
 			// refresh limiter forever.
 			if !c.refreshAllowed() {
+				// The gate blocks another refresh *attempt*, not the
+				// notification: this request's credential was still
+				// rejected, and that must reach cluster recovery even
+				// though no refresh runs. Without this, a caller gated
+				// shut before its first delivery lands is stuck forever.
+				if isTerminalAuthError(resp.Code) {
+					c.fireAccessTokenInvalid(usedToken)
+				}
 				return response, &Error{Code: resp.Code, Message: resp.Message}
 			}
 			c.refreshMu.Lock()
@@ -202,9 +210,18 @@ func (c *Client) authRequest(ctx context.Context, url, method string, respData a
 			// A direct terminal auth error, or a second terminal 401 after
 			// refresh, proves the complete pair unusable. A 40140117 throttle
 			// remains retryable after cooldown.
-			if c.markTokenDead() {
-				c.fireAccessTokenInvalid(usedToken)
-			}
+			//
+			// fireAccessTokenInvalid is level-triggered: every rejected
+			// request reports, not just the one that flips the latch (that
+			// is markTokenDead's return value, which we ignore here). The
+			// consumer applies its own generation check and may drop a
+			// stale delivery; if that were the only one ever sent, this
+			// client would go silent for the rest of its process lifetime.
+			// markTokenDead's internal fireTokenInvalid stays edge-triggered
+			// on purpose -- that is a distinct one-shot "start cluster
+			// recovery" signal, not a per-request status report.
+			c.markTokenDead()
+			c.fireAccessTokenInvalid(usedToken)
 		}
 		return response, &Error{Code: resp.Code, Message: resp.Message}
 	}
