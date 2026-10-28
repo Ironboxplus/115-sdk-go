@@ -1,5 +1,7 @@
 package sdk
 
+const apiQrCodeHost = "https://qrcodeapi.115.com"
+
 const (
 	ApiBaseURL = "https://proapi.115.com"
 	ApiAuthURL = "https://passportapi.115.com"

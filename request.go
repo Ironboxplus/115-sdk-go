@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"resty.dev/v3"
@@ -48,7 +49,23 @@ func isEmptyData(data json.RawMessage) bool {
 	return len(d) == 0 || bytes.Equal(d, []byte("null"))
 }
 
+// rewriteURL applies the base-URL overrides (WithAPIBaseURL, WithPassportBaseURL).
+func (c *Client) rewriteURL(u string) string {
+	if c.apiBase != "" && strings.HasPrefix(u, ApiBaseURL) {
+		return c.apiBase + u[len(ApiBaseURL):]
+	}
+	if c.passportBase != "" {
+		for _, host := range []string{ApiAuthURL, apiQrCodeHost} {
+			if strings.HasPrefix(u, host) {
+				return c.passportBase + u[len(host):]
+			}
+		}
+	}
+	return u
+}
+
 func (c *Client) Request(ctx context.Context, url string, method string, opts ...RestyOption) (*resty.Response, error) {
+	url = c.rewriteURL(url)
 	req := c.NewRequest(ctx)
 	for _, opt := range opts {
 		opt(req)
@@ -172,12 +189,29 @@ func (c *Client) authRequest(ctx context.Context, url, method string, respData a
 			// of hitting the passport endpoint again. This is what stops a
 			// retrying caller (video player at 1 req/s) from feeding 115's
 			// refresh limiter forever.
+			trigger := codeTrigger(resp.Code)
+			if c.refreshPolicy != nil && !c.refreshPolicy() {
+				// Not the refresher: never call passport. The rejected
+				// credential still reaches recovery (peer pull).
+				dead, cd := c.gateState()
+				c.fireRefreshResult(RefreshEvent{Trigger: trigger, GateDead: dead, CooldownRemaining: cd, Outcome: RefreshSkippedPolicy})
+				if isTerminalAuthError(resp.Code) {
+					c.fireAccessTokenInvalid(usedToken)
+				}
+				return response, &Error{Code: resp.Code, Message: resp.Message}
+			}
 			if !c.refreshAllowed() {
 				// The gate blocks another refresh *attempt*, not the
 				// notification: this request's credential was still
 				// rejected, and that must reach cluster recovery even
 				// though no refresh runs. Without this, a caller gated
 				// shut before its first delivery lands is stuck forever.
+				dead, cd := c.gateState()
+				outcome := RefreshSkippedCooldown
+				if dead {
+					outcome = RefreshSkippedDead
+				}
+				c.fireRefreshResult(RefreshEvent{Trigger: trigger, GateDead: dead, CooldownRemaining: cd, Outcome: outcome})
 				if isTerminalAuthError(resp.Code) {
 					c.fireAccessTokenInvalid(usedToken)
 				}
@@ -191,7 +225,7 @@ func (c *Client) authRequest(ctx context.Context, url, method string, respData a
 				// sent, it must run to completion or the rotated refresh_token
 				// is lost (see refreshTimeout).
 				refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshTimeout)
-				_, err := c.RefreshToken(refreshCtx)
+				_, err := c.refreshWithTrigger(refreshCtx, trigger)
 				cancel()
 				c.refreshMu.Unlock()
 				if err != nil {

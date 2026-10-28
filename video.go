@@ -13,8 +13,8 @@ type VideoPlayURL struct {
 }
 
 type VideoPlayResp struct {
-	FileID   string         `json:"file_id"`
-	FileName string         `json:"file_name"`
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name"`
 	// 115's /open/video/play returns these numeric fields as quoted strings,
 	// so they use FlexInt64 to tolerate both string and number JSON shapes.
 	FileSize FlexInt64      `json:"file_size"`

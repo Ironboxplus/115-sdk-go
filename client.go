@@ -15,6 +15,16 @@ type Client struct {
 	accessToken    string
 	refreshToken   string
 	onRefreshToken func(string, string)
+	// onRefreshTokenEx is onRefreshToken plus the new access token lifetime.
+	onRefreshTokenEx func(accessToken, refreshToken string, expiresIn int64)
+	// onRefreshResult observes every refresh attempt and every gated skip.
+	onRefreshResult func(RefreshEvent)
+	// refreshPolicy, when set, is consulted before an automatic refresh; false
+	// means this client must not call passport (a non-refresher cluster member).
+	refreshPolicy func() bool
+	// apiBase / passportBase override the 115 hosts (tests against a local server).
+	apiBase      string
+	passportBase string
 	// onTokenValid fires after any authenticated request succeeds, i.e. the token
 	// in use is proven good. onTokenInvalid fires when the refresh_token is found
 	// dead (CodeRefreshTokenError) and re-auth/peer-recovery is required. Both let

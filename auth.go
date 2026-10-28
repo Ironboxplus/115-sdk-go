@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"net/http"
+	"time"
 )
 
 type AuthDeviceCodeResp struct {
@@ -77,21 +79,52 @@ func (c *Client) CodeToToken(ctx context.Context, uid, codeVerifier string) (*Co
 
 type RefreshTokenResp CodeToTokenResp
 
+// RefreshToken spends the current refresh_token at passport and installs the
+// new pair. It does not take the refresh lock or consult the refresh policy;
+// automatic refreshes go through authRequest and RefreshProactive instead.
 func (c *Client) RefreshToken(ctx context.Context) (*RefreshTokenResp, error) {
+	return c.refreshWithTrigger(ctx, RefreshTriggerManual)
+}
+
+func (c *Client) refreshWithTrigger(ctx context.Context, trigger string) (*RefreshTokenResp, error) {
+	dead, cooldown := c.gateState()
+	oldHash := tokenHash(c.refreshToken)
+	start := time.Now()
 	var resp RefreshTokenResp
 	_, err := c.passportRequest(ctx, ApiRefreshToken, http.MethodPost, &resp, ReqWithForm(Form{
 		"refresh_token": c.refreshToken,
 	}))
-	// Any refresh-endpoint 401, including 40140117, latches the complete pair
-	// dead. Transient transport failures only arm a low-frequency cooldown.
+	// A refresh-endpoint 401 latches the complete pair dead, except 40140117
+	// (refresh frequently), which is only a throttle and arms the cooldown.
+	// Transient transport failures also only arm the cooldown.
 	c.noteRefreshOutcome(err)
+	ev := RefreshEvent{
+		Trigger:           trigger,
+		GateDead:          dead,
+		CooldownRemaining: cooldown,
+		Duration:          time.Since(start),
+		OldRefreshHash:    oldHash,
+	}
 	if err != nil {
+		ev.Err = err
+		var apiErr *Error
+		if errors.As(err, &apiErr) {
+			ev.Outcome, ev.ErrCode = RefreshAPIError, apiErr.Code
+		} else {
+			ev.Outcome = RefreshTransportError
+		}
+		c.fireRefreshResult(ev)
 		return nil, err
 	}
 	c.SetAccessToken(resp.AccessToken)
 	c.SetRefreshToken(resp.RefreshToken)
+	ev.Outcome, ev.ExpiresIn, ev.NewRefreshHash = RefreshOK, resp.ExpiresIn, tokenHash(resp.RefreshToken)
 	if c.onRefreshToken != nil {
 		c.onRefreshToken(resp.AccessToken, resp.RefreshToken)
 	}
-	return &resp, err
+	if c.onRefreshTokenEx != nil {
+		c.onRefreshTokenEx(resp.AccessToken, resp.RefreshToken, resp.ExpiresIn)
+	}
+	c.fireRefreshResult(ev)
+	return &resp, nil
 }

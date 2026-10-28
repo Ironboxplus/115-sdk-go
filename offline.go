@@ -67,20 +67,20 @@ type OfflineTaskListResp struct {
 }
 
 type OfflineTask struct {
-	InfoHash     string `json:"info_hash"`      // 任务 sha1
-	AddTime      int64  `json:"add_time"`       // 添加时间戳
-	PercentDone  float64 `json:"percentDone"`  // 下载进度
-	Size         int64  `json:"size"`           // 总大小（字节）
-	Name         string `json:"name"`           // 任务名
-	LastUpdate   int64  `json:"last_update"`    // 最后更新时间戳
-	FileID       string `json:"file_id"`        // 文件或文件夹 ID
-	DeleteFileID string `json:"delete_file_id"` // 删除源文件时需传递的 ID
-	Status       int    `json:"status"`         // 任务状态（-1失败，0分配中，1下载中，2成功）
-	URL          string `json:"url"`            // 链接 URL
-	WpPathID     string `json:"wp_path_id"`     // 所在父文件夹 ID
-	Def2         int    `json:"def2"`           // 视频清晰度（1~5, 100）
-	PlayLong     int    `json:"play_long"`      // 视频时长
-	CanAppeal    int    `json:"can_appeal"`     // 是否可申诉
+	InfoHash     string  `json:"info_hash"`      // 任务 sha1
+	AddTime      int64   `json:"add_time"`       // 添加时间戳
+	PercentDone  float64 `json:"percentDone"`    // 下载进度
+	Size         int64   `json:"size"`           // 总大小（字节）
+	Name         string  `json:"name"`           // 任务名
+	LastUpdate   int64   `json:"last_update"`    // 最后更新时间戳
+	FileID       string  `json:"file_id"`        // 文件或文件夹 ID
+	DeleteFileID string  `json:"delete_file_id"` // 删除源文件时需传递的 ID
+	Status       int     `json:"status"`         // 任务状态（-1失败，0分配中，1下载中，2成功）
+	URL          string  `json:"url"`            // 链接 URL
+	WpPathID     string  `json:"wp_path_id"`     // 所在父文件夹 ID
+	Def2         int     `json:"def2"`           // 视频清晰度（1~5, 100）
+	PlayLong     int     `json:"play_long"`      // 视频时长
+	CanAppeal    int     `json:"can_appeal"`     // 是否可申诉
 }
 
 func (t *OfflineTask) IsTodo() bool {

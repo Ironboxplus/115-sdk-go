@@ -414,21 +414,21 @@ func (f *FlexInt64) UnmarshalJSON(data []byte) error {
 }
 
 type RbListResp_FileInfo struct {
-	ID         string `json:"id"`
-	FileName   string `json:"file_name"`
-	Type       string `json:"type"`
-	FileSize   string `json:"file_size"`
-	Dtime      string `json:"dtime"`
-	ThumbURL   string `json:"thumb_url"`
-	Status     string `json:"status"`
+	ID         string     `json:"id"`
+	FileName   string     `json:"file_name"`
+	Type       string     `json:"type"`
+	FileSize   string     `json:"file_size"`
+	Dtime      string     `json:"dtime"`
+	ThumbURL   string     `json:"thumb_url"`
+	Status     string     `json:"status"`
 	CID        FlexString `json:"cid"`
-	ParentName string `json:"parent_name"`
-	PickCode   string `json:"pick_code"`
-	IsV        int    `json:"isv"`
-	Ico        string `json:"ico"`
-	Muc        string `json:"muc"`
-	DImg       string `json:"d_img"`
-	SHA1       string `json:"sha1"`
+	ParentName string     `json:"parent_name"`
+	PickCode   string     `json:"pick_code"`
+	IsV        int        `json:"isv"`
+	Ico        string     `json:"ico"`
+	Muc        string     `json:"muc"`
+	DImg       string     `json:"d_img"`
+	SHA1       string     `json:"sha1"`
 }
 
 type RbListResp struct {

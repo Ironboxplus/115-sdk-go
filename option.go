@@ -1,6 +1,10 @@
 package sdk
 
-import "resty.dev/v3"
+import (
+	"strings"
+
+	"resty.dev/v3"
+)
 
 type Option func(*Client)
 
@@ -72,5 +76,47 @@ func WithOnAccessTokenInvalid(fn func(accessToken string)) Option {
 func WithOnTokenInvalid(fn func()) Option {
 	return func(w *Client) {
 		w.SetOnTokenInvalid(fn)
+	}
+}
+
+// WithOnRefreshTokenEx is WithOnRefreshToken plus the lifetime (seconds) of the
+// new access token, so callers can schedule a proactive refresh.
+func WithOnRefreshTokenEx(fn func(accessToken, refreshToken string, expiresIn int64)) Option {
+	return func(w *Client) {
+		w.onRefreshTokenEx = fn
+	}
+}
+
+// WithOnRefreshResult registers an observer fired for every refresh attempt
+// (success or failure) and every automatic refresh skipped by the policy or the
+// dead/cooldown gate. The event never carries token values.
+func WithOnRefreshResult(fn func(RefreshEvent)) Option {
+	return func(w *Client) {
+		w.onRefreshResult = fn
+	}
+}
+
+// WithRefreshPolicy registers a check consulted before an automatic refresh.
+// When it returns false the client does not call passport: terminal 401s still
+// fire the access-token-invalid notification and the API error is returned.
+func WithRefreshPolicy(fn func() bool) Option {
+	return func(w *Client) {
+		w.refreshPolicy = fn
+	}
+}
+
+// WithAPIBaseURL redirects file/user API calls (default ApiBaseURL), e.g. to a
+// local test server.
+func WithAPIBaseURL(base string) Option {
+	return func(w *Client) {
+		w.apiBase = strings.TrimRight(base, "/")
+	}
+}
+
+// WithPassportBaseURL redirects passport/auth calls (default ApiAuthURL and
+// the QR status host), e.g. to a local test server.
+func WithPassportBaseURL(base string) Option {
+	return func(w *Client) {
+		w.passportBase = strings.TrimRight(base, "/")
 	}
 }

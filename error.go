@@ -7,6 +7,10 @@ import (
 
 var ErrObjectNotFound = errors.New("object not found")
 
+// ErrRefreshGated is returned by RefreshProactive when the dead latch or the
+// refresh cooldown forbids calling passport.
+var ErrRefreshGated = errors.New("token refresh gated")
+
 var ErrDataEmpty = errors.New("api returned empty data")
 
 const (
