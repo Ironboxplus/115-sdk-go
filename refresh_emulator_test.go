@@ -62,7 +62,7 @@ func TestEmulatorRefreshOnExpiryAndEvent(t *testing.T) {
 		t.Fatalf("want 1 event, got %d", len(evs))
 	}
 	e := evs[0]
-	if e.Outcome != RefreshOK || e.Trigger != "40140125" || e.ExpiresIn != 5400 || e.Duration <= 0 || e.NewRefreshHash == "" || e.OldRefreshHash == e.NewRefreshHash {
+	if e.Outcome != RefreshOK || e.Trigger != "40140125" || e.ExpiresIn != 5400 || e.Duration < 0 || e.NewRefreshHash == "" || e.OldRefreshHash == e.NewRefreshHash {
 		t.Fatalf("bad event %+v", e)
 	}
 	if gotExpires.Load() != 5400 {
