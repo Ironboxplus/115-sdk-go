@@ -87,18 +87,24 @@ func (c *Client) fireRefreshResult(ev RefreshEvent) {
 // refreshes, but not the refresh policy: the caller is by definition the node
 // that decided it should refresh. It returns ErrRefreshGated when blocked.
 func (c *Client) RefreshProactive(ctx context.Context) (*RefreshTokenResp, error) {
+	return c.RefreshWithTrigger(ctx, RefreshTriggerProactive)
+}
+
+// RefreshWithTrigger is RefreshProactive with a caller-chosen Trigger label in
+// the RefreshEvent (e.g. a refresh performed on behalf of another node).
+func (c *Client) RefreshWithTrigger(ctx context.Context, trigger string) (*RefreshTokenResp, error) {
 	dead, cd := c.gateState()
 	if dead || cd > 0 {
 		outcome := RefreshSkippedCooldown
 		if dead {
 			outcome = RefreshSkippedDead
 		}
-		c.fireRefreshResult(RefreshEvent{Trigger: RefreshTriggerProactive, GateDead: dead, CooldownRemaining: cd, Outcome: outcome})
+		c.fireRefreshResult(RefreshEvent{Trigger: trigger, GateDead: dead, CooldownRemaining: cd, Outcome: outcome})
 		return nil, ErrRefreshGated
 	}
 	c.refreshMu.Lock()
 	defer c.refreshMu.Unlock()
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshTimeout)
 	defer cancel()
-	return c.refreshWithTrigger(rctx, RefreshTriggerProactive)
+	return c.refreshWithTrigger(rctx, trigger)
 }
